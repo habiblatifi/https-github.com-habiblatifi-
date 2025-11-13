@@ -1,0 +1,8 @@
+{
+  "name": "PillPal: Medication Tracker :)",
+  "description": "A comprehensive mobile application to help patients track their daily medications, identify pills with a camera, set reminders, and check for drug interactions to ensure safe and effective treatment management.",
+  "requestFramePermissions": [
+    "camera",
+    "microphone"
+  ]
+}

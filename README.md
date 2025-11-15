@@ -17,8 +17,8 @@ GEMINI_API_KEY=your_api_key_here
 
 Run the app locally
 
-```bash
-npm run dev
+   ```bash
+   npm run dev
 
 Open your browser and navigate to:
 

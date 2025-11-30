@@ -50,7 +50,15 @@ export const checkInteractions = async (medications: string[]): Promise<Interact
     const result = JSON.parse(jsonString);
     return result;
 
-  } catch (error) {
+  } catch (error: any) {
+    // Handle quota exceeded errors gracefully
+    if (error?.error?.code === 429 || error?.status === 429 || error?.message?.includes('quota') || error?.message?.includes('429')) {
+      console.warn("Gemini API quota exceeded. Skipping interaction check.");
+      return {
+        hasInteractions: false,
+        summary: "Interaction checking is temporarily unavailable due to API quota limits. Please try again later.",
+      };
+    }
     console.error("Gemini API error in checkInteractions:", error);
     return {
       hasInteractions: false,
@@ -59,11 +67,29 @@ export const checkInteractions = async (medications: string[]): Promise<Interact
   }
 };
 
-export const identifyMedication = async (base64Image: string): Promise<Partial<Medication>> => {
+export const identifyMedication = async (base64Image: string, mimeType: string = 'image/jpeg', retryCount: number = 0): Promise<Partial<Medication>> => {
+  // Check if API key is configured
+  if (!process.env.API_KEY || process.env.API_KEY === 'undefined' || process.env.API_KEY === '') {
+    throw new Error("API key is not configured. Please set GEMINI_API_KEY in your .env file.");
+  }
+
+  const maxRetries = 2;
+  const retryDelay = 1000 * (retryCount + 1); // Exponential backoff: 1s, 2s
+
   try {
+    // Normalize MIME type - default to jpeg if not provided or invalid
+    let normalizedMimeType = mimeType || 'image/jpeg';
+    if (!normalizedMimeType.startsWith('image/')) {
+      normalizedMimeType = 'image/jpeg';
+    }
+    // Gemini supports: image/jpeg, image/png, image/webp, image/heic, image/heif
+    if (!['image/jpeg', 'image/png', 'image/webp', 'image/heic', 'image/heif'].includes(normalizedMimeType)) {
+      normalizedMimeType = 'image/jpeg'; // Fallback to jpeg
+    }
+
     const imagePart = {
       inlineData: {
-        mimeType: 'image/jpeg',
+        mimeType: normalizedMimeType,
         data: base64Image,
       },
     };
@@ -97,17 +123,137 @@ export const identifyMedication = async (base64Image: string): Promise<Partial<M
     });
     
     const jsonString = response.text.trim();
-    const result = JSON.parse(jsonString);
+    let result;
+    
+    try {
+      result = JSON.parse(jsonString);
+    } catch (parseError) {
+      console.error("Failed to parse JSON response:", parseError);
+      console.error("Response text:", jsonString);
+      throw new Error("Invalid response from medication identification service.");
+    }
+
+    // Validate that we got a result object
+    if (!result || typeof result !== 'object') {
+      console.error("Invalid result format:", result);
+      throw new Error("Invalid response format from medication identification service.");
+    }
 
     if (result.food && !['With food', 'Without food', 'No specific instructions'].includes(result.food)) {
         result.food = 'No specific instructions';
     }
 
-    return result as Partial<Medication>;
+    // Log the result for debugging
+    console.log("Identification result:", { 
+      name: result.name, 
+      dosage: result.dosage, 
+      hasName: !!result.name,
+      nameLength: result.name?.length,
+      nameTrimmed: result.name?.trim().length,
+      fullResult: result
+    });
 
-  } catch (error) {
+    // Ensure we return a valid object even if name is empty
+    return {
+      name: result.name || '',
+      dosage: result.dosage || '',
+      frequency: result.frequency || '',
+      food: result.food || 'No specific instructions',
+      drugClass: result.drugClass || '',
+      sideEffects: result.sideEffects || '',
+      imprint: result.imprint || '',
+      shape: result.shape || '',
+      color: result.color || '',
+      usageNote: result.usageNote || '',
+      similarMeds: result.similarMeds || [],
+    } as Partial<Medication>;
+
+  } catch (error: any) {
     console.error("Gemini API error in identifyMedication:", error);
-    throw new Error("Failed to identify medication from image.");
+    
+    // Provide more specific error messages
+    if (error?.message?.includes('API_KEY') || error?.message?.includes('api key') || error?.message?.includes('authentication')) {
+      throw new Error("Invalid or missing API key. Please check your GEMINI_API_KEY in the .env file.");
+    }
+    // Check for quota/rate limit errors and retry if we haven't exceeded max retries
+    const isQuotaError = error?.message?.includes('quota') || 
+                         error?.message?.includes('rate limit') ||
+                         error?.message?.includes('RESOURCE_EXHAUSTED') ||
+                         error?.error?.code === 429 ||
+                         error?.code === 429 ||
+                         error?.status === 429;
+    
+    // Check for service unavailable/overloaded errors (503)
+    const isServiceUnavailable = error?.error?.code === 503 ||
+                                 error?.code === 503 ||
+                                 error?.status === 503 ||
+                                 error?.error?.status === 'UNAVAILABLE' ||
+                                 error?.message?.includes('overloaded') ||
+                                 error?.message?.includes('UNAVAILABLE') ||
+                                 error?.error?.message?.includes('overloaded');
+    
+    if ((isQuotaError || isServiceUnavailable) && retryCount < maxRetries) {
+      const errorType = isServiceUnavailable ? 'Service unavailable' : 'Quota';
+      console.log(`${errorType} error detected. Retrying in ${retryDelay}ms... (attempt ${retryCount + 1}/${maxRetries})`);
+      await new Promise(resolve => setTimeout(resolve, retryDelay));
+      return identifyMedication(base64Image, mimeType, retryCount + 1);
+    }
+    
+    if (isQuotaError) {
+      // For quota errors after retries, return empty result to allow manual entry instead of throwing
+      console.warn("API quota exceeded after retries. Allowing manual entry.");
+      return {
+        name: '',
+        dosage: '',
+        frequency: '',
+        food: 'No specific instructions',
+        drugClass: '',
+        sideEffects: '',
+        imprint: '',
+        shape: '',
+        color: '',
+        usageNote: '',
+        similarMeds: [],
+      } as Partial<Medication>;
+    }
+    
+    if (isServiceUnavailable) {
+      // For service unavailable errors, return empty result to allow manual entry
+      console.warn("API service unavailable. Allowing manual entry.");
+      throw new Error("The medication identification service is temporarily overloaded. Please try again later or enter the details manually.");
+    }
+    if (error?.message?.includes('invalid') && error?.message?.includes('image')) {
+      throw new Error("Invalid image format. Please try a different image.");
+    }
+    
+    // Format error message to be user-friendly
+    let errorMessage = '';
+    if (error?.error?.message) {
+      errorMessage = error.error.message;
+    } else if (error?.message) {
+      errorMessage = error.message;
+    } else if (typeof error === 'string') {
+      errorMessage = error;
+    } else {
+      errorMessage = 'An unexpected error occurred';
+    }
+    
+    // Clean up error message - remove JSON formatting if present
+    if (errorMessage.includes('{') && errorMessage.includes('}')) {
+      try {
+        const errorObj = JSON.parse(errorMessage);
+        if (errorObj.error?.message) {
+          errorMessage = errorObj.error.message;
+        } else if (errorObj.message) {
+          errorMessage = errorObj.message;
+        }
+      } catch {
+        // If parsing fails, use the original message but clean it up
+        errorMessage = errorMessage.replace(/\{.*?\}/g, '').trim();
+      }
+    }
+    
+    throw new Error(errorMessage || 'Failed to identify medication. Please try again or enter details manually.');
   }
 };
 
